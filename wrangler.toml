@@ -1,0 +1,30 @@
+name = "echo-subscription"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-subscription"
+database_id = "9da221a9-6fcb-4a1b-88bc-113b349cd0b7"
+
+[[kv_namespaces]]
+binding = "SB_CACHE"
+id = "75f24a486c9b4c799b326c591109fdaf"
+
+[triggers]
+crons = ["0 3 * * *"]
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[[services]]
+binding = "EMAIL_SENDER"
+service = "echo-email-sender"
