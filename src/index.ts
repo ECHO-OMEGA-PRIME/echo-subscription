@@ -239,23 +239,48 @@ export default {
 
       log('info', 'Free trial started', { email, service: serviceId, tier: tierName, trial_end: trialEnd, customer_id: customerId });
 
-      // Send welcome email
+      // Send branded onboarding welcome email
       try {
+        const productName = serviceId.replace(/^echo-/, '').replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
+        const tierLabel = tierName.charAt(0).toUpperCase() + tierName.slice(1);
+        const expiryDate = new Date(trialEnd.replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+        const productSlug = serviceId.replace(/^echo-/, '');
         await env.EMAIL_SENDER.fetch('https://echo-email-sender.bmcii1976.workers.dev/send', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             to: email,
-            subject: `Your ${serviceId.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())} trial is active!`,
-            html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:20px">
-              <h1 style="color:#0d7377">Welcome to Echo Prime Technologies!</h1>
-              <p>Hi ${name || 'there'},</p>
-              <p>Your <strong>14-day free trial</strong> of <strong>${serviceId.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())} — ${tierName.charAt(0).toUpperCase() + tierName.slice(1)}</strong> is now active.</p>
-              <p>Your trial expires on <strong>${new Date(trialEnd.replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</strong>.</p>
-              <p><a href="https://echo-ept.com/dashboard" style="display:inline-block;background:#0d7377;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Go to Dashboard</a></p>
-              <p style="color:#666;font-size:12px">No credit card required. Upgrade anytime from your dashboard.</p>
-              <p style="color:#666;font-size:12px">— Echo Prime Technologies, Midland TX</p>
-            </div>`,
+            subject: `Your ${productName} trial is live — here's how to get started`,
+            html: `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<div style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;margin-top:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
+  <div style="background:linear-gradient(135deg,#0d7377 0%,#14b8a6 100%);padding:32px 24px;text-align:center">
+    <h1 style="color:#ffffff;margin:0;font-size:24px;font-weight:700">Welcome to Echo Prime</h1>
+    <p style="color:rgba(255,255,255,0.9);margin:8px 0 0;font-size:15px">Your ${productName} trial is active</p>
+  </div>
+  <div style="padding:32px 24px">
+    <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 16px">Hi ${name || 'there'},</p>
+    <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 24px">Your <strong>14-day free trial</strong> of <strong>${productName} — ${tierLabel}</strong> is now active. No credit card needed. Full access to all features.</p>
+    <div style="background:#f0fdfa;border:1px solid #99f6e4;border-radius:8px;padding:16px;margin:0 0 24px">
+      <p style="margin:0 0 8px;color:#0d7377;font-weight:600;font-size:14px">Quick Start Guide</p>
+      <table style="width:100%;border-collapse:collapse"><tbody>
+        <tr><td style="padding:6px 0;color:#475569;font-size:14px">1. Open your dashboard</td></tr>
+        <tr><td style="padding:6px 0;color:#475569;font-size:14px">2. Explore the API at <code style="background:#e2e8f0;padding:2px 6px;border-radius:4px;font-size:13px">${serviceId}.bmcii1976.workers.dev</code></td></tr>
+        <tr><td style="padding:6px 0;color:#475569;font-size:14px">3. Read the docs at <a href="https://echo-ept.com/docs/${productSlug}" style="color:#0d7377">echo-ept.com/docs/${productSlug}</a></td></tr>
+      </tbody></table>
+    </div>
+    <div style="text-align:center;margin:0 0 24px">
+      <a href="https://echo-ept.com/dashboard" style="display:inline-block;background:#0d7377;color:#ffffff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px">Open Dashboard</a>
+    </div>
+    <div style="background:#fefce8;border:1px solid #fde68a;border-radius:8px;padding:12px 16px;margin:0 0 24px">
+      <p style="margin:0;color:#92400e;font-size:13px"><strong>Trial expires:</strong> ${expiryDate}. Upgrade anytime from your dashboard to keep your data.</p>
+    </div>
+    <p style="color:#64748b;font-size:14px;line-height:1.6;margin:0 0 8px">Need help? Reply to this email or visit <a href="https://echo-ept.com/support" style="color:#0d7377">echo-ept.com/support</a></p>
+  </div>
+  <div style="background:#f8fafc;padding:20px 24px;border-top:1px solid #e2e8f0;text-align:center">
+    <p style="color:#94a3b8;font-size:12px;margin:0">Echo Prime Technologies — Midland, TX</p>
+    <p style="color:#94a3b8;font-size:11px;margin:4px 0 0"><a href="https://echo-ept.com" style="color:#94a3b8">echo-ept.com</a></p>
+  </div>
+</div></body></html>`,
           }),
         });
       } catch (emailErr) {
