@@ -108,6 +108,45 @@ export default {
       return jsonOk({ ok: true, service: 'echo-subscription', version: '2.0.0', timestamp: now(), stripe: !!env.STRIPE_SECRET_KEY });
     }
 
+    // ── Revenue Metrics ── (authenticated — key KPIs for dashboards)
+    if (p === '/metrics' && m === 'GET') {
+      if (!authOk(req, env)) return jsonErr('Unauthorized', 401);
+      const db = env.DB;
+      const [active, trialing, canceled, pastDue, totalCustomers, totalRevenue, recentTrials, recentConversions] = await Promise.all([
+        db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='active'").first(),
+        db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='trialing'").first(),
+        db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='canceled'").first(),
+        db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='past_due'").first(),
+        db.prepare("SELECT COUNT(*) as c FROM customers").first(),
+        db.prepare("SELECT COALESCE(SUM(c.lifetime_value),0) as total FROM customers c WHERE c.status='active'").first(),
+        db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='trialing' AND created_at>=datetime('now','-30 days')").first(),
+        db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='active' AND trial_end IS NOT NULL AND created_at>=datetime('now','-30 days')").first(),
+      ]);
+      const activeCount = Number(active?.c) || 0;
+      const trialingCount = Number(trialing?.c) || 0;
+      const canceledCount = Number(canceled?.c) || 0;
+      const trialCount30d = Number(recentTrials?.c) || 0;
+      const conversionCount30d = Number(recentConversions?.c) || 0;
+      const conversionRate = trialCount30d > 0 ? Math.round((conversionCount30d / trialCount30d) * 100) : 0;
+      const churnRate = (activeCount + canceledCount) > 0 ? Math.round((canceledCount / (activeCount + canceledCount)) * 100) : 0;
+      return jsonOk({
+        ok: true,
+        metrics: {
+          active_subscriptions: activeCount,
+          trialing: trialingCount,
+          canceled: canceledCount,
+          past_due: Number(pastDue?.c) || 0,
+          total_customers: Number(totalCustomers?.c) || 0,
+          lifetime_revenue: Number(totalRevenue?.total) || 0,
+          trial_conversion_rate_30d: conversionRate,
+          churn_rate: churnRate,
+          trials_last_30d: trialCount30d,
+          conversions_last_30d: conversionCount30d,
+        },
+        timestamp: now(),
+      });
+    }
+
     // Rate limit GET
     if (m === 'GET' && !(await rateLimit(env.SB_CACHE, `rl:${ip(req)}`, 60, 60000))) {
       log('warn', 'Rate limited (GET)', { path: p, ip: ip(req) });
