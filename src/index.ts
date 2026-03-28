@@ -136,11 +136,12 @@ export default {
     if (p === '/metrics' && m === 'GET') {
       if (!authOk(req, env)) return jsonErr('Unauthorized', 401);
       const db = env.DB;
-      const [active, trialing, canceled, pastDue, totalCustomers, totalRevenue, recentTrials, recentConversions] = await Promise.all([
+      const [active, trialing, canceled, pastDue, expired, totalCustomers, totalRevenue, recentTrials, recentConversions] = await Promise.all([
         db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='active'").first(),
         db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='trialing'").first(),
         db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='canceled'").first(),
         db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='past_due'").first(),
+        db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='expired'").first(),
         db.prepare("SELECT COUNT(*) as c FROM customers").first(),
         db.prepare("SELECT COALESCE(SUM(c.lifetime_value),0) as total FROM customers c WHERE c.status='active'").first(),
         db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status='trialing' AND created_at>=datetime('now','-30 days')").first(),
@@ -149,6 +150,7 @@ export default {
       const activeCount = Number(active?.c) || 0;
       const trialingCount = Number(trialing?.c) || 0;
       const canceledCount = Number(canceled?.c) || 0;
+      const expiredCount = Number(expired?.c) || 0;
       const trialCount30d = Number(recentTrials?.c) || 0;
       const conversionCount30d = Number(recentConversions?.c) || 0;
       const conversionRate = trialCount30d > 0 ? Math.round((conversionCount30d / trialCount30d) * 100) : 0;
@@ -160,6 +162,7 @@ export default {
           trialing: trialingCount,
           canceled: canceledCount,
           past_due: Number(pastDue?.c) || 0,
+          expired: expiredCount,
           total_customers: Number(totalCustomers?.c) || 0,
           lifetime_revenue: Number(totalRevenue?.total) || 0,
           trial_conversion_rate_30d: conversionRate,
@@ -298,7 +301,7 @@ export default {
       const customer = await db.prepare("SELECT id,email,name,created_at FROM customers WHERE email=? LIMIT 1").bind(email).first();
       if (!customer) return jsonOk({ ok: true, trials: [], subscriptions: [] });
       const trials = await db.prepare(
-        "SELECT s.id,s.status,s.trial_start,s.trial_end,s.created_at,p.name as plan_name,p.price as plan_price,p.interval as plan_interval,p.metadata as plan_metadata FROM subscriptions s JOIN plans p ON s.plan_id=p.id WHERE s.customer_id=? AND s.status='trialing' ORDER BY s.created_at DESC"
+        "SELECT s.id,s.status,s.trial_start,s.trial_end,s.created_at,p.name as plan_name,p.price as plan_price,p.interval as plan_interval,p.metadata as plan_metadata FROM subscriptions s JOIN plans p ON s.plan_id=p.id WHERE s.customer_id=? AND s.status IN ('trialing','expired') ORDER BY s.created_at DESC"
       ).bind(customer.id).all();
       const subscriptions = await db.prepare(
         "SELECT s.id,s.status,s.current_period_start,s.current_period_end,s.created_at,p.name as plan_name,p.price as plan_price,p.interval as plan_interval FROM subscriptions s JOIN plans p ON s.plan_id=p.id WHERE s.customer_id=? AND s.status IN ('active','past_due','paused') ORDER BY s.created_at DESC"
@@ -1038,8 +1041,57 @@ export default {
       }
     }
 
-    // 4. Expire trials
-    await db.prepare("UPDATE subscriptions SET status='past_due',updated_at=? WHERE status='trialing' AND trial_end<=?").bind(n, n).run();
+    // 4. Expire trials — mark as 'expired' (NOT 'past_due' — trials have no payment method)
+    const justExpired = await db.prepare(
+      "SELECT s.id,s.customer_id,s.trial_end,s.plan_id,c.email,c.name,c.metadata FROM subscriptions s JOIN customers c ON s.customer_id=c.id WHERE s.status='trialing' AND s.trial_end<=?"
+    ).bind(n).all();
+    if (justExpired.results.length > 0) {
+      await db.prepare("UPDATE subscriptions SET status='expired',updated_at=? WHERE status='trialing' AND trial_end<=?").bind(n, n).run();
+      // Send trial expired emails
+      for (const trial of justExpired.results as Record<string, unknown>[]) {
+        const email = trial.email as string;
+        const trialName = trial.name as string;
+        let svcId = '';
+        try { const meta = JSON.parse(trial.metadata as string || '{}'); svcId = meta.service_id || ''; } catch {}
+        const productName = svcId.replace(/^echo-/, '').replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
+        const productSlug = svcId.replace(/^echo-/, '');
+        try {
+          await env.EMAIL_SENDER.fetch('https://echo-email-sender.bmcii1976.workers.dev/send', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              to: email,
+              subject: `Your ${productName} trial has ended — reactivate anytime`,
+              html: `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<div style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;margin-top:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
+  <div style="background:linear-gradient(135deg,#475569 0%,#64748b 100%);padding:32px 24px;text-align:center">
+    <h1 style="color:#ffffff;margin:0;font-size:22px;font-weight:700">Your Trial Has Ended</h1>
+    <p style="color:rgba(255,255,255,0.9);margin:8px 0 0;font-size:15px">${productName}</p>
+  </div>
+  <div style="padding:32px 24px">
+    <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 16px">Hi ${trialName || 'there'},</p>
+    <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 24px">Your 14-day free trial of <strong>${productName}</strong> has ended. Your data is saved for 30 days — upgrade to pick up right where you left off.</p>
+    <div style="background:#f0fdfa;border:1px solid #99f6e4;border-radius:8px;padding:16px;margin:0 0 24px">
+      <p style="margin:0 0 8px;color:#0d7377;font-weight:600;font-size:14px">What you get with a paid plan:</p>
+      <ul style="margin:0;padding-left:20px;color:#334155;font-size:14px;line-height:1.8"><li>Full API access with higher rate limits</li><li>Priority support</li><li>All your trial data preserved</li><li>New features as they launch</li></ul>
+    </div>
+    <div style="text-align:center;margin:0 0 24px">
+      <a href="https://echo-ept.com/checkout?service=${svcId}" style="display:inline-block;background:#0d7377;color:#ffffff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px">Upgrade Now</a>
+    </div>
+    <p style="color:#64748b;font-size:14px;margin:0">Questions? Reply to this email or visit <a href="https://echo-ept.com/support" style="color:#0d7377">support</a></p>
+  </div>
+  <div style="background:#f8fafc;padding:20px 24px;border-top:1px solid #e2e8f0;text-align:center">
+    <p style="color:#94a3b8;font-size:12px;margin:0">Echo Prime Technologies — Midland, TX</p>
+  </div>
+</div></body></html>`,
+            }),
+          });
+          log('info', 'Trial expired email sent', { email, subscription_id: trial.id });
+        } catch (emailErr) {
+          log('warn', 'Trial expired email failed', { email, error: String(emailErr) });
+        }
+      }
+      log('info', 'Trials expired', { count: justExpired.results.length });
+    }
 
     // 4b. Trial expiration reminder — 2 days before trial ends
     const twoDaysFromNow = new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 19).replace('T', ' ');
