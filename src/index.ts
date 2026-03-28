@@ -113,6 +113,95 @@ export default {
       log('warn', 'Rate limited (GET)', { path: p, ip: ip(req) });
       return jsonErr('Rate limited', 429);
     }
+    // ── Free Trial Signup ── (public — no auth required, rate limited)
+    if (p === '/trial/start' && m === 'POST') {
+      if (!(await rateLimit(env.SB_CACHE, `rl:trial:${ip(req)}`, 5, 3600000))) return jsonErr('Too many trial requests', 429);
+      const rawBody = await req.text();
+      let trialBody: Record<string, unknown>;
+      try { trialBody = JSON.parse(rawBody); } catch { return jsonErr('Invalid JSON', 400); }
+
+      const email = sanitize(String(trialBody.email || ''), 255).toLowerCase().trim();
+      const name = sanitize(String(trialBody.name || ''), 200);
+      const serviceId = sanitize(String(trialBody.service_id || ''), 100);
+      const tierName = sanitize(String(trialBody.tier || 'professional'), 50);
+      const trialDays = 14;
+
+      if (!email || !email.includes('@')) return jsonErr('Valid email required');
+      if (!serviceId) return jsonErr('service_id required');
+
+      const db = env.DB;
+
+      // Check if email already has a trial or active subscription
+      const existing = await db.prepare("SELECT id,status FROM customers WHERE email=? LIMIT 1").bind(email).first();
+      if (existing) {
+        const activeSub = await db.prepare("SELECT id,status FROM subscriptions WHERE customer_id=? AND status IN ('active','trialing') LIMIT 1").bind(existing.id).first();
+        if (activeSub) return jsonErr('You already have an active subscription or trial', 409);
+      }
+
+      // Create or update customer
+      let customerId: number;
+      if (existing) {
+        customerId = existing.id as number;
+        await db.prepare("UPDATE customers SET name=COALESCE(NULLIF(?,''),name),status='active',updated_at=? WHERE id=?").bind(name, now(), customerId).run();
+      } else {
+        const res = await db.prepare('INSERT INTO customers (org_id,email,name,payment_method,metadata) VALUES (?,?,?,?,?)').bind(
+          1, email, name || email.split('@')[0], 'trial', JSON.stringify({ service_id: serviceId, tier: tierName, trial_start: now() })
+        ).run();
+        customerId = res.meta.last_row_id as number;
+      }
+
+      // Find or create trial plan
+      const planSlug = `${serviceId}-${tierName}-trial`;
+      let plan = await db.prepare('SELECT * FROM plans WHERE slug=? AND org_id=1 LIMIT 1').bind(planSlug).first();
+      if (!plan) {
+        await db.prepare('INSERT INTO plans (org_id,name,slug,price,interval,trial_days,is_public) VALUES (?,?,?,?,?,?,?)').bind(
+          1, `${serviceId} ${tierName} (14-day trial)`, planSlug, 0, 'monthly', trialDays, 0
+        ).run();
+        plan = await db.prepare('SELECT * FROM plans WHERE slug=? AND org_id=1 LIMIT 1').bind(planSlug).first();
+      }
+
+      if (!plan) return jsonErr('Failed to create trial plan', 500);
+
+      // Create trial subscription
+      const n = now();
+      const trialEnd = calcPeriodEnd(n, 'daily', trialDays);
+      const periodEnd = calcPeriodEnd(trialEnd, 'monthly', 1);
+      await db.prepare('INSERT INTO subscriptions (org_id,customer_id,plan_id,quantity,status,trial_start,trial_end,current_period_start,current_period_end) VALUES (?,?,?,?,?,?,?,?,?)').bind(
+        1, customerId, plan.id, 1, 'trialing', n, trialEnd, n, periodEnd
+      ).run();
+
+      await db.prepare('INSERT INTO activity_log (org_id,actor,action,target,details) VALUES (?,?,?,?,?)').bind(
+        1, 'trial_signup', 'trial.started', `customer:${customerId}`, `service:${serviceId} tier:${tierName} email:${email} expires:${trialEnd}`
+      ).run();
+
+      log('info', 'Free trial started', { email, service: serviceId, tier: tierName, trial_end: trialEnd, customer_id: customerId });
+
+      // Send welcome email
+      try {
+        await env.EMAIL_SENDER.fetch('https://echo-email-sender.bmcii1976.workers.dev/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: email,
+            subject: `Your ${serviceId.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())} trial is active!`,
+            html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:20px">
+              <h1 style="color:#0d7377">Welcome to Echo Prime Technologies!</h1>
+              <p>Hi ${name || 'there'},</p>
+              <p>Your <strong>14-day free trial</strong> of <strong>${serviceId.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase())} — ${tierName.charAt(0).toUpperCase() + tierName.slice(1)}</strong> is now active.</p>
+              <p>Your trial expires on <strong>${new Date(trialEnd.replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</strong>.</p>
+              <p><a href="https://echo-ept.com/dashboard" style="display:inline-block;background:#0d7377;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Go to Dashboard</a></p>
+              <p style="color:#666;font-size:12px">No credit card required. Upgrade anytime from your dashboard.</p>
+              <p style="color:#666;font-size:12px">— Echo Prime Technologies, Midland TX</p>
+            </div>`,
+          }),
+        });
+      } catch (emailErr) {
+        log('warn', 'Trial welcome email failed', { email, error: String(emailErr) });
+      }
+
+      return jsonOk({ ok: true, trial: { email, service_id: serviceId, tier: tierName, trial_days: trialDays, trial_end: trialEnd, customer_id: customerId } }, 201);
+    }
+
     // ── Stripe Checkout Session ── (public — creates a payment session)
     if (p === '/stripe/checkout-session' && m === 'POST') {
       if (!env.STRIPE_SECRET_KEY) return jsonErr('Stripe not configured', 503);
