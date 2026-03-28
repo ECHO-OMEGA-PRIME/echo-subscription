@@ -8,6 +8,7 @@ interface Env {
   SHARED_BRAIN: Fetcher;
   EMAIL_SENDER: Fetcher;
   ECHO_API_KEY: string;
+  STRIPE_WEBHOOK_SECRET?: string;
 }
 
 interface RLState { c: number; t: number }
@@ -42,6 +43,38 @@ async function rateLimit(kv: KVNamespace, key: string, max: number, windowMs: nu
 }
 
 function ip(req: Request): string { return req.headers.get('CF-Connecting-IP') || 'unknown'; }
+
+async function verifyStripeSignature(body: string, sigHeader: string, secret: string): Promise<boolean> {
+  const parts = sigHeader.split(',').reduce((acc: Record<string, string>, part) => {
+    const [key, value] = part.split('=');
+    acc[key] = value;
+    return acc;
+  }, {});
+
+  const timestamp = parts['t'];
+  const signature = parts['v1'];
+  if (!timestamp || !signature) return false;
+
+  // Reject timestamps older than 5 minutes (replay protection)
+  const age = Math.floor(Date.now() / 1000) - parseInt(timestamp);
+  if (age > 300) return false;
+
+  const payload = `${timestamp}.${body}`;
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+  const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  // Constant-time comparison
+  if (expected.length !== signature.length) return false;
+  let result = 0;
+  for (let i = 0; i < expected.length; i++) {
+    result |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+  }
+  return result === 0;
+}
 
 function log(level: string, message: string, meta: Record<string, any> = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), level, worker: 'echo-subscription', message, ...meta }));
@@ -78,6 +111,33 @@ export default {
       log('warn', 'Rate limited (GET)', { path: p, ip: ip(req) });
       return jsonErr('Rate limited', 429);
     }
+    // ── Stripe Webhook (must be before generic auth + body parsing) ──
+    if (p === '/webhooks/stripe' && m === 'POST') {
+      const rawBody = await req.text();
+      const sigHeader = req.headers.get('Stripe-Signature') || '';
+      if (env.STRIPE_WEBHOOK_SECRET) {
+        if (!sigHeader) {
+          log('warn', 'Stripe webhook missing signature header', { ip: ip(req) });
+          return jsonErr('Missing Stripe-Signature header', 401);
+        }
+        const valid = await verifyStripeSignature(rawBody, sigHeader, env.STRIPE_WEBHOOK_SECRET);
+        if (!valid) {
+          log('warn', 'Stripe webhook signature verification failed', { ip: ip(req) });
+          return jsonErr('Invalid webhook signature', 401);
+        }
+      }
+      let event: Record<string, unknown>;
+      try { event = JSON.parse(rawBody) as Record<string, unknown>; } catch { return jsonErr('Invalid JSON', 400); }
+      const eventType = String(event.type || 'unknown');
+      const eventId = String(event.id || '');
+      log('info', 'Stripe webhook received', { event_type: eventType, event_id: eventId, ip: ip(req) });
+      const db = env.DB;
+      await db.prepare('INSERT INTO webhook_events (org_id,event_type,payload) VALUES (?,?,?)').bind(
+        0, `stripe.${eventType}`, rawBody
+      ).run();
+      return jsonOk({ ok: true, received: true, event_type: eventType });
+    }
+
     // Rate limit + auth for writes
     if (m !== 'GET') {
       if (!authOk(req, env)) {
