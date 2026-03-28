@@ -290,6 +290,51 @@ export default {
       return jsonOk({ ok: true, trial: { email, service_id: serviceId, tier: tierName, trial_days: trialDays, trial_end: trialEnd, customer_id: customerId } }, 201);
     }
 
+    // ── Trial Status Lookup ── (public — email-based lookup for customer portal)
+    if (p === '/trial/status' && m === 'GET') {
+      const email = url.searchParams.get('email')?.toLowerCase().trim();
+      if (!email || !email.includes('@')) return jsonErr('Valid email required');
+      const db = env.DB;
+      const customer = await db.prepare("SELECT id,email,name,created_at FROM customers WHERE email=? LIMIT 1").bind(email).first();
+      if (!customer) return jsonOk({ ok: true, trials: [], subscriptions: [] });
+      const trials = await db.prepare(
+        "SELECT s.id,s.status,s.trial_start,s.trial_end,s.created_at,p.name as plan_name,p.price as plan_price,p.interval as plan_interval,p.metadata as plan_metadata FROM subscriptions s JOIN plans p ON s.plan_id=p.id WHERE s.customer_id=? AND s.status='trialing' ORDER BY s.created_at DESC"
+      ).bind(customer.id).all();
+      const subscriptions = await db.prepare(
+        "SELECT s.id,s.status,s.current_period_start,s.current_period_end,s.created_at,p.name as plan_name,p.price as plan_price,p.interval as plan_interval FROM subscriptions s JOIN plans p ON s.plan_id=p.id WHERE s.customer_id=? AND s.status IN ('active','past_due','paused') ORDER BY s.created_at DESC"
+      ).bind(customer.id).all();
+      const trialData = (trials.results || []).map((t: any) => {
+        const trialEnd = new Date(String(t.trial_end).replace(' ', 'T') + 'Z');
+        const now_ms = Date.now();
+        const daysRemaining = Math.max(0, Math.ceil((trialEnd.getTime() - now_ms) / 86400000));
+        // Extract service_id and tier from plan_name format: "echo-crm professional (14-day trial)"
+        const planName = String(t.plan_name || '');
+        const nameParts = planName.replace(/ \(.*\)$/, '').split(' ');
+        const serviceId = nameParts[0] || '';
+        const tier = nameParts.slice(1).join(' ') || '';
+        const productSlug = serviceId.replace(/^echo-/, '');
+        const productName = productSlug.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
+        return {
+          id: t.id, status: t.status, plan_name: t.plan_name, plan_price: t.plan_price, plan_interval: t.plan_interval,
+          service_id: serviceId, tier, product_name: productName, product_slug: productSlug,
+          trial_start: t.trial_start, trial_end: t.trial_end, days_remaining: daysRemaining,
+          expired: daysRemaining === 0,
+          api_url: `https://${serviceId}.bmcii1976.workers.dev`,
+          docs_url: `https://echo-ept.com/docs/${productSlug}`,
+          product_url: `https://echo-ept.com/${productSlug}`,
+        };
+      });
+      return jsonOk({
+        ok: true,
+        customer: { name: customer.name, email: customer.email, since: customer.created_at },
+        trials: trialData,
+        subscriptions: (subscriptions.results || []).map((s: any) => ({
+          id: s.id, status: s.status, plan_name: s.plan_name, plan_price: s.plan_price, plan_interval: s.plan_interval,
+          period_start: s.current_period_start, period_end: s.current_period_end,
+        })),
+      });
+    }
+
     // ── Stripe Checkout Session ── (public — creates a payment session)
     if (p === '/stripe/checkout-session' && m === 'POST') {
       if (!env.STRIPE_SECRET_KEY) return jsonErr('Stripe not configured', 503);
