@@ -1010,20 +1010,35 @@ export default {
       try { const meta = JSON.parse(trial.metadata as string || '{}'); serviceId = meta.service_id || ''; tierName = meta.tier || ''; } catch {}
       const serviceName = serviceId.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
       try {
+        const expiryDate = new Date(trialEnd.replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+        const productSlug = serviceId.replace(/^echo-/, '');
         await env.EMAIL_SENDER.fetch('https://echo-email-sender.bmcii1976.workers.dev/send', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             to: email,
-            subject: `Your ${serviceName} trial ends in 2 days`,
-            html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:20px">
-              <h1 style="color:#0d7377">Your trial is ending soon</h1>
-              <p>Hi ${name || 'there'},</p>
-              <p>Your <strong>14-day free trial</strong> of <strong>${serviceName}${tierName ? ' — ' + tierName.charAt(0).toUpperCase() + tierName.slice(1) : ''}</strong> ends on <strong>${new Date(trialEnd.replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}</strong>.</p>
-              <p>To keep using all features without interruption, upgrade now:</p>
-              <p><a href="https://echo-ept.com/pricing" style="display:inline-block;background:#0d7377;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Upgrade Now</a></p>
-              <p style="color:#666;font-size:12px">If you don't upgrade, your account will be paused but your data will be saved for 30 days.</p>
-              <p style="color:#666;font-size:12px">— Echo Prime Technologies, Midland TX</p>
-            </div>`,
+            subject: `Your ${serviceName} trial ends in 2 days — upgrade to keep your data`,
+            html: `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<div style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;margin-top:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
+  <div style="background:linear-gradient(135deg,#dc2626 0%,#ef4444 100%);padding:32px 24px;text-align:center">
+    <h1 style="color:#ffffff;margin:0;font-size:22px;font-weight:700">Your Trial Ends in 2 Days</h1>
+    <p style="color:rgba(255,255,255,0.9);margin:8px 0 0;font-size:15px">${serviceName}${tierName ? ' — ' + tierName.charAt(0).toUpperCase() + tierName.slice(1) : ''}</p>
+  </div>
+  <div style="padding:32px 24px">
+    <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 16px">Hi ${name || 'there'},</p>
+    <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 24px">Your free trial of <strong>${serviceName}</strong> expires on <strong>${expiryDate}</strong>. Upgrade now to keep full access to all features and your data.</p>
+    <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:16px;margin:0 0 24px">
+      <p style="margin:0;color:#991b1b;font-size:14px"><strong>What happens if you don't upgrade:</strong></p>
+      <ul style="margin:8px 0 0;padding-left:20px;color:#991b1b;font-size:14px"><li>Your account will be paused</li><li>Data is saved for 30 days</li><li>You can reactivate anytime</li></ul>
+    </div>
+    <div style="text-align:center;margin:0 0 24px">
+      <a href="https://echo-ept.com/pricing" style="display:inline-block;background:#0d7377;color:#ffffff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px">Upgrade Now</a>
+    </div>
+    <p style="color:#64748b;font-size:14px;line-height:1.6;margin:0">Questions? Reply to this email or visit <a href="https://echo-ept.com/support" style="color:#0d7377">echo-ept.com/support</a></p>
+  </div>
+  <div style="background:#f8fafc;padding:20px 24px;border-top:1px solid #e2e8f0;text-align:center">
+    <p style="color:#94a3b8;font-size:12px;margin:0">Echo Prime Technologies — Midland, TX</p>
+  </div>
+</div></body></html>`,
           }),
         });
         await db.prepare('INSERT INTO activity_log (org_id,actor,action,target,details) VALUES (?,?,?,?,?)').bind(
@@ -1032,6 +1047,63 @@ export default {
         log('info', 'Trial reminder email sent', { email, trial_end: trialEnd, subscription_id: trial.id });
       } catch (emailErr) {
         log('warn', 'Trial reminder email failed', { email, error: String(emailErr) });
+      }
+    }
+
+    // 4c. Day-1 activation nudge — sent 24h after trial start to drive first use
+    const oneDayAgo = new Date(Date.now() - 86400000).toISOString().slice(0, 19).replace('T', ' ');
+    const twoDaysAgo = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 19).replace('T', ' ');
+    const inactiveTrials = await db.prepare(
+      "SELECT s.id,s.customer_id,s.trial_start,s.trial_end,s.plan_id,c.email,c.name,c.metadata FROM subscriptions s JOIN customers c ON s.customer_id=c.id WHERE s.status='trialing' AND s.trial_start<=? AND s.trial_start>=? AND NOT EXISTS (SELECT 1 FROM activity_log WHERE action='trial.day1_sent' AND target='subscription:'||s.id)"
+    ).bind(oneDayAgo, twoDaysAgo).all();
+    for (const trial of inactiveTrials.results as Record<string, unknown>[]) {
+      const email = trial.email as string;
+      const trialName = trial.name as string;
+      let svcId = ''; let tName = '';
+      try { const meta = JSON.parse(trial.metadata as string || '{}'); svcId = meta.service_id || ''; tName = meta.tier || ''; } catch {}
+      const productName = svcId.replace(/^echo-/, '').replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
+      const productSlug = svcId.replace(/^echo-/, '');
+      try {
+        await env.EMAIL_SENDER.fetch('https://echo-email-sender.bmcii1976.workers.dev/send', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: email,
+            subject: `Getting started with ${productName} — 3 things to try today`,
+            html: `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;padding:0;background:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif">
+<div style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;margin-top:20px;margin-bottom:20px;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
+  <div style="background:linear-gradient(135deg,#0d7377 0%,#14b8a6 100%);padding:32px 24px;text-align:center">
+    <h1 style="color:#ffffff;margin:0;font-size:22px;font-weight:700">Day 1: Let's Get You Started</h1>
+    <p style="color:rgba(255,255,255,0.9);margin:8px 0 0;font-size:15px">${productName}</p>
+  </div>
+  <div style="padding:32px 24px">
+    <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 16px">Hi ${trialName || 'there'},</p>
+    <p style="color:#334155;font-size:16px;line-height:1.6;margin:0 0 24px">You signed up for ${productName} yesterday. Here are 3 quick wins to get the most from your trial:</p>
+    <div style="background:#f0fdfa;border-left:4px solid #14b8a6;padding:16px;margin:0 0 12px;border-radius:0 8px 8px 0">
+      <p style="margin:0;color:#0f766e;font-size:14px"><strong>1. Explore the API</strong> — Your endpoint is live at <code style="background:#e2e8f0;padding:2px 6px;border-radius:4px;font-size:13px">${svcId}.bmcii1976.workers.dev</code></p>
+    </div>
+    <div style="background:#f0fdfa;border-left:4px solid #14b8a6;padding:16px;margin:0 0 12px;border-radius:0 8px 8px 0">
+      <p style="margin:0;color:#0f766e;font-size:14px"><strong>2. Read the docs</strong> — Step-by-step guides at <a href="https://echo-ept.com/docs/${productSlug}" style="color:#0d7377">echo-ept.com/docs/${productSlug}</a></p>
+    </div>
+    <div style="background:#f0fdfa;border-left:4px solid #14b8a6;padding:16px;margin:0 0 24px;border-radius:0 8px 8px 0">
+      <p style="margin:0;color:#0f766e;font-size:14px"><strong>3. Test from the dashboard</strong> — <a href="https://echo-ept.com/dashboard" style="color:#0d7377">echo-ept.com/dashboard</a></p>
+    </div>
+    <div style="text-align:center;margin:0 0 24px">
+      <a href="https://echo-ept.com/${productSlug}" style="display:inline-block;background:#0d7377;color:#ffffff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px">Open ${productName}</a>
+    </div>
+    <p style="color:#64748b;font-size:14px;margin:0">Need help? Reply to this email — we respond within hours.</p>
+  </div>
+  <div style="background:#f8fafc;padding:20px 24px;border-top:1px solid #e2e8f0;text-align:center">
+    <p style="color:#94a3b8;font-size:12px;margin:0">Echo Prime Technologies — Midland, TX</p>
+  </div>
+</div></body></html>`,
+          }),
+        });
+        await db.prepare('INSERT INTO activity_log (org_id,actor,action,target,details) VALUES (?,?,?,?,?)').bind(
+          1, 'system', 'trial.day1_sent', `subscription:${trial.id}`, `email:${email}`
+        ).run();
+        log('info', 'Day-1 activation email sent', { email, subscription_id: trial.id });
+      } catch (emailErr) {
+        log('warn', 'Day-1 activation email failed', { email, error: String(emailErr) });
       }
     }
 
