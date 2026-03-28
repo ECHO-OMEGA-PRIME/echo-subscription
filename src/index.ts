@@ -102,6 +102,21 @@ function calcPeriodEnd(start: string, interval: string, count: number): string {
 function now(): string { return new Date().toISOString().slice(0, 19).replace('T', ' '); }
 function today(): string { return new Date().toISOString().slice(0, 10); }
 
+
+// Security headers
+const SEC_HEADERS: Record<string, string> = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'X-XSS-Protection': '1; mode=block',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+};
+function withSecHeaders(res: Response): Response {
+  const h = new Headers(res.headers);
+  for (const [k, v] of Object.entries(SEC_HEADERS)) h.set(k, v);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     setCorsOrigin(req);
