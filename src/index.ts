@@ -908,6 +908,45 @@ export default {
     // 4. Expire trials
     await db.prepare("UPDATE subscriptions SET status='past_due',updated_at=? WHERE status='trialing' AND trial_end<=?").bind(n, n).run();
 
+    // 4b. Trial expiration reminder — 2 days before trial ends
+    const twoDaysFromNow = new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 19).replace('T', ' ');
+    const expiringTrials = await db.prepare(
+      "SELECT s.id,s.customer_id,s.trial_end,s.plan_id,c.email,c.name,c.metadata FROM subscriptions s JOIN customers c ON s.customer_id=c.id WHERE s.status='trialing' AND s.trial_end<=? AND s.trial_end>? AND NOT EXISTS (SELECT 1 FROM activity_log WHERE action='trial.reminder_sent' AND target='subscription:'||s.id)"
+    ).bind(twoDaysFromNow, n).all();
+    for (const trial of expiringTrials.results as Record<string, unknown>[]) {
+      const email = trial.email as string;
+      const name = trial.name as string;
+      const trialEnd = trial.trial_end as string;
+      let serviceId = '';
+      let tierName = '';
+      try { const meta = JSON.parse(trial.metadata as string || '{}'); serviceId = meta.service_id || ''; tierName = meta.tier || ''; } catch {}
+      const serviceName = serviceId.replace(/-/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
+      try {
+        await env.EMAIL_SENDER.fetch('https://echo-email-sender.bmcii1976.workers.dev/send', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: email,
+            subject: `Your ${serviceName} trial ends in 2 days`,
+            html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:20px">
+              <h1 style="color:#0d7377">Your trial is ending soon</h1>
+              <p>Hi ${name || 'there'},</p>
+              <p>Your <strong>14-day free trial</strong> of <strong>${serviceName}${tierName ? ' — ' + tierName.charAt(0).toUpperCase() + tierName.slice(1) : ''}</strong> ends on <strong>${new Date(trialEnd.replace(' ', 'T') + 'Z').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}</strong>.</p>
+              <p>To keep using all features without interruption, upgrade now:</p>
+              <p><a href="https://echo-ept.com/pricing" style="display:inline-block;background:#0d7377;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold">Upgrade Now</a></p>
+              <p style="color:#666;font-size:12px">If you don't upgrade, your account will be paused but your data will be saved for 30 days.</p>
+              <p style="color:#666;font-size:12px">— Echo Prime Technologies, Midland TX</p>
+            </div>`,
+          }),
+        });
+        await db.prepare('INSERT INTO activity_log (org_id,actor,action,target,details) VALUES (?,?,?,?,?)').bind(
+          1, 'system', 'trial.reminder_sent', `subscription:${trial.id}`, `email:${email} trial_end:${trialEnd}`
+        ).run();
+        log('info', 'Trial reminder email sent', { email, trial_end: trialEnd, subscription_id: trial.id });
+      } catch (emailErr) {
+        log('warn', 'Trial reminder email failed', { email, error: String(emailErr) });
+      }
+    }
+
     // 5. Resume paused subscriptions
     await db.prepare("UPDATE subscriptions SET status='active',pause_start=null,pause_end=null,updated_at=? WHERE status='paused' AND pause_end IS NOT NULL AND pause_end<=?").bind(n, n).run();
 
