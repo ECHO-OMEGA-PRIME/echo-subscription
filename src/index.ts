@@ -43,6 +43,10 @@ async function rateLimit(kv: KVNamespace, key: string, max: number, windowMs: nu
 
 function ip(req: Request): string { return req.headers.get('CF-Connecting-IP') || 'unknown'; }
 
+function log(level: string, message: string, meta: Record<string, any> = {}) {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), level, worker: 'echo-subscription', message, ...meta }));
+}
+
 function calcPeriodEnd(start: string, interval: string, count: number): string {
   const d = new Date(start);
   if (interval === 'yearly') d.setFullYear(d.getFullYear() + count);
@@ -64,19 +68,31 @@ export default {
     const m = req.method;
 
     // Health
-    if (p === '/health' || p === '/') return jsonOk({ ok: true, service: 'echo-subscription', version: '1.0.0', timestamp: now() });
+    if (p === '/health' || p === '/') {
+      log('info', 'Health check', { path: p, ip: ip(req) });
+      return jsonOk({ ok: true, service: 'echo-subscription', version: '1.1.0', timestamp: now() });
+    }
 
     // Rate limit GET
-    if (m === 'GET' && !(await rateLimit(env.SB_CACHE, `rl:${ip(req)}`, 60, 60000))) return jsonErr('Rate limited', 429);
+    if (m === 'GET' && !(await rateLimit(env.SB_CACHE, `rl:${ip(req)}`, 60, 60000))) {
+      log('warn', 'Rate limited (GET)', { path: p, ip: ip(req) });
+      return jsonErr('Rate limited', 429);
+    }
     // Rate limit + auth for writes
     if (m !== 'GET') {
-      if (!authOk(req, env)) return jsonErr('Unauthorized', 401);
-      if (!(await rateLimit(env.SB_CACHE, `rl:w:${ip(req)}`, 30, 60000))) return jsonErr('Rate limited', 429);
+      if (!authOk(req, env)) {
+        log('warn', 'Auth failure', { path: p, method: m, ip: ip(req) });
+        return jsonErr('Unauthorized', 401);
+      }
+      if (!(await rateLimit(env.SB_CACHE, `rl:w:${ip(req)}`, 30, 60000))) {
+        log('warn', 'Rate limited (write)', { path: p, method: m, ip: ip(req) });
+        return jsonErr('Rate limited', 429);
+      }
     }
 
     const db = env.DB;
     let body: Record<string, unknown> = {};
-    if (m === 'POST' || m === 'PUT') { try { body = await req.json() as Record<string, unknown>; } catch { return jsonErr('Invalid JSON'); } }
+    if (m === 'POST' || m === 'PUT') { try { body = await req.json() as Record<string, unknown>; } catch { log('warn', 'Invalid JSON body', { path: p, method: m, ip: ip(req) }); return jsonErr('Invalid JSON'); } }
 
     // ── Organizations ──
     if (p === '/orgs' && m === 'GET') {
@@ -470,7 +486,8 @@ export default {
         });
         const aiResult = await resp.json() as Record<string, unknown>;
         return jsonOk({ ok: true, customers: customers.results, ai_analysis: aiResult });
-      } catch {
+      } catch (err) {
+        log('error', 'Churn prediction AI call failed', { org_id: orgId, error: String(err) });
         return jsonOk({ ok: true, customers: customers.results, ai_analysis: null });
       }
     }
@@ -488,7 +505,8 @@ export default {
         });
         const aiResult = await resp.json() as Record<string, unknown>;
         return jsonOk({ ok: true, historical: revenue.results, subscription_breakdown: subs.results, forecast: aiResult });
-      } catch {
+      } catch (err) {
+        log('error', 'Revenue forecast AI call failed', { org_id: orgId, error: String(err) });
         return jsonOk({ ok: true, historical: revenue.results, subscription_breakdown: subs.results, forecast: null });
       }
     }
@@ -507,10 +525,12 @@ export default {
       return jsonOk({ ok: true, subscriptions: subs.results });
     }
 
+    log('warn', 'Route not found', { path: p, method: m, ip: ip(req) });
     return jsonErr('Not found', 404);
   },
 
   async scheduled(event: ScheduledEvent, env: Env) {
+    log('info', 'Scheduled cron started', { cron: event.cron });
     const db = env.DB;
     const n = now();
     const t = today();
@@ -538,6 +558,8 @@ export default {
       // Advance period
       await db.prepare('UPDATE subscriptions SET current_period_start=?,current_period_end=?,updated_at=? WHERE id=?').bind(newPeriodStart, newPeriodEnd, n, sub.id).run();
     }
+
+    log('info', 'Renewals processed', { count: dueRenewals.results.length });
 
     // 2. Cancel pending_cancel subscriptions at period end
     await db.prepare("UPDATE subscriptions SET status='canceled',updated_at=? WHERE status='pending_cancel' AND current_period_end<=?").bind(n, n).run();
@@ -578,5 +600,6 @@ export default {
         orgId, t, mrrVal, mrrVal * 12, active?.c || 0, newSubs?.c || 0, churned?.c || 0, trials?.c || 0, Number(paidToday?.total) || 0, Number(outstanding?.total) || 0
       ).run();
     }
+    log('info', 'Scheduled cron completed', { orgs_processed: orgs.results.length, renewals: dueRenewals.results.length, dunning: pastDue.results.length });
   }
 };
