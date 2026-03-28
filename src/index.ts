@@ -1,4 +1,4 @@
-// Echo Subscription v1.0.0 — AI-Powered Subscription Billing
+// Echo Subscription v2.0.0 — AI-Powered Subscription Billing + Stripe Checkout
 // Cloudflare Worker: D1 + KV + Service Bindings
 
 interface Env {
@@ -8,7 +8,9 @@ interface Env {
   SHARED_BRAIN: Fetcher;
   EMAIL_SENDER: Fetcher;
   ECHO_API_KEY: string;
+  STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
+  SITE_URL?: string;
 }
 
 interface RLState { c: number; t: number }
@@ -103,7 +105,7 @@ export default {
     // Health
     if (p === '/health' || p === '/') {
       log('info', 'Health check', { path: p, ip: ip(req) });
-      return jsonOk({ ok: true, service: 'echo-subscription', version: '1.1.0', timestamp: now() });
+      return jsonOk({ ok: true, service: 'echo-subscription', version: '2.0.0', timestamp: now(), stripe: !!env.STRIPE_SECRET_KEY });
     }
 
     // Rate limit GET
@@ -111,6 +113,106 @@ export default {
       log('warn', 'Rate limited (GET)', { path: p, ip: ip(req) });
       return jsonErr('Rate limited', 429);
     }
+    // ── Stripe Checkout Session ── (public — creates a payment session)
+    if (p === '/stripe/checkout-session' && m === 'POST') {
+      if (!env.STRIPE_SECRET_KEY) return jsonErr('Stripe not configured', 503);
+      const rawBody = await req.text();
+      let checkoutBody: Record<string, unknown>;
+      try { checkoutBody = JSON.parse(rawBody); } catch { return jsonErr('Invalid JSON', 400); }
+
+      const { plan_name, price_cents, interval, customer_email, customer_name, service_id, tier, success_url, cancel_url, coupon_code } = checkoutBody as Record<string, string>;
+      if (!price_cents || !plan_name) return jsonErr('plan_name, price_cents required');
+
+      const siteUrl = env.SITE_URL || 'https://echo-ept.com';
+      const successRedirect = success_url || `${siteUrl}/checkout/success?method=stripe&session_id={CHECKOUT_SESSION_ID}&service=${service_id || ''}&tier=${tier || ''}`;
+      const cancelRedirect = cancel_url || `${siteUrl}/checkout?service=${service_id || ''}&tier=${tier || ''}`;
+
+      // Build Stripe Checkout Session via REST API
+      const params = new URLSearchParams();
+      params.append('mode', interval === 'year' || interval === 'yearly' ? 'subscription' : (interval === 'month' || interval === 'monthly' ? 'subscription' : 'payment'));
+      params.append('success_url', successRedirect);
+      params.append('cancel_url', cancelRedirect);
+      params.append('line_items[0][price_data][currency]', 'usd');
+      params.append('line_items[0][price_data][product_data][name]', String(plan_name));
+      if (service_id) params.append('line_items[0][price_data][product_data][metadata][service_id]', String(service_id));
+      if (tier) params.append('line_items[0][price_data][product_data][metadata][tier]', String(tier));
+      params.append('line_items[0][price_data][unit_amount]', String(Math.round(Number(price_cents))));
+      if (params.get('mode') === 'subscription') {
+        const recInterval = (interval === 'year' || interval === 'yearly') ? 'year' : 'month';
+        params.append('line_items[0][price_data][recurring][interval]', recInterval);
+      }
+      params.append('line_items[0][quantity]', '1');
+      if (customer_email) params.append('customer_email', String(customer_email));
+      params.append('automatic_tax[enabled]', 'true');
+      params.append('allow_promotion_codes', 'true');
+      params.append('billing_address_collection', 'required');
+      params.append('payment_method_types[0]', 'card');
+      if (service_id) params.append('metadata[service_id]', String(service_id));
+      if (tier) params.append('metadata[tier]', String(tier));
+      if (customer_name) params.append('metadata[customer_name]', String(customer_name));
+
+      try {
+        const stripeResp = await fetch('https://api.stripe.com/v1/checkout/sessions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: params.toString(),
+        });
+        const session = await stripeResp.json() as Record<string, unknown>;
+        if (!stripeResp.ok) {
+          log('error', 'Stripe checkout session creation failed', { status: stripeResp.status, error: session });
+          return jsonErr(`Stripe error: ${(session.error as Record<string, string>)?.message || 'Unknown'}`, 502);
+        }
+        log('info', 'Stripe checkout session created', { session_id: session.id, amount: price_cents, plan: plan_name });
+        return jsonOk({ ok: true, session_id: session.id, url: session.url });
+      } catch (err) {
+        log('error', 'Stripe API call failed', { error: String(err) });
+        return jsonErr('Stripe API unreachable', 502);
+      }
+    }
+
+    // ── Stripe Customer Portal ── (authenticated — manage billing)
+    if (p === '/stripe/portal-session' && m === 'POST') {
+      if (!env.STRIPE_SECRET_KEY) return jsonErr('Stripe not configured', 503);
+      if (!authOk(req, env)) return jsonErr('Unauthorized', 401);
+      const rawBody = await req.text();
+      let portalBody: Record<string, unknown>;
+      try { portalBody = JSON.parse(rawBody); } catch { return jsonErr('Invalid JSON', 400); }
+
+      const customerId = String(portalBody.stripe_customer_id || '');
+      if (!customerId) return jsonErr('stripe_customer_id required');
+
+      const siteUrl = env.SITE_URL || 'https://echo-ept.com';
+      const returnUrl = String(portalBody.return_url || `${siteUrl}/dashboard`);
+
+      const params = new URLSearchParams();
+      params.append('customer', customerId);
+      params.append('return_url', returnUrl);
+
+      try {
+        const stripeResp = await fetch('https://api.stripe.com/v1/billing_portal/sessions', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: params.toString(),
+        });
+        const session = await stripeResp.json() as Record<string, unknown>;
+        if (!stripeResp.ok) {
+          log('error', 'Stripe portal session creation failed', { status: stripeResp.status, error: session });
+          return jsonErr(`Stripe error: ${(session.error as Record<string, string>)?.message || 'Unknown'}`, 502);
+        }
+        log('info', 'Stripe portal session created', { customer: customerId });
+        return jsonOk({ ok: true, url: session.url });
+      } catch (err) {
+        log('error', 'Stripe portal API call failed', { error: String(err) });
+        return jsonErr('Stripe API unreachable', 502);
+      }
+    }
+
     // ── Stripe Webhook (must be before generic auth + body parsing) ──
     if (p === '/webhooks/stripe' && m === 'POST') {
       const rawBody = await req.text();
@@ -135,6 +237,79 @@ export default {
       await db.prepare('INSERT INTO webhook_events (org_id,event_type,payload) VALUES (?,?,?)').bind(
         0, `stripe.${eventType}`, rawBody
       ).run();
+
+      // Process important Stripe events
+      const data = event.data as Record<string, unknown> | undefined;
+      const obj = data?.object as Record<string, unknown> | undefined;
+      if (obj) {
+        try {
+          if (eventType === 'checkout.session.completed') {
+            const customerEmail = String(obj.customer_email || obj.customer_details && (obj.customer_details as Record<string, unknown>).email || '');
+            const stripeCustomerId = String(obj.customer || '');
+            const metadata = obj.metadata as Record<string, string> | undefined;
+            const serviceId = metadata?.service_id || '';
+            const tierName = metadata?.tier || '';
+            const amountTotal = Number(obj.amount_total || 0) / 100;
+            const paymentStatus = String(obj.payment_status || '');
+
+            log('info', 'Checkout completed', { email: customerEmail, service: serviceId, tier: tierName, amount: amountTotal, payment_status: paymentStatus });
+
+            if (customerEmail && paymentStatus === 'paid') {
+              // Find or create customer in D1
+              let customer = await db.prepare('SELECT * FROM customers WHERE email=? LIMIT 1').bind(customerEmail).first();
+              if (!customer) {
+                const custName = metadata?.customer_name || customerEmail.split('@')[0];
+                await db.prepare('INSERT INTO customers (org_id,email,name,payment_method,payment_token,metadata) VALUES (?,?,?,?,?,?)').bind(
+                  1, customerEmail, custName, 'stripe', stripeCustomerId, JSON.stringify({ stripe_customer_id: stripeCustomerId, service_id: serviceId, tier: tierName })
+                ).run();
+                customer = await db.prepare('SELECT * FROM customers WHERE email=? LIMIT 1').bind(customerEmail).first();
+              } else if (stripeCustomerId) {
+                await db.prepare('UPDATE customers SET payment_method=?,payment_token=?,updated_at=? WHERE id=?').bind('stripe', stripeCustomerId, now(), customer.id).run();
+              }
+
+              // Find matching plan or create a default one
+              if (customer && serviceId) {
+                let plan = await db.prepare('SELECT * FROM plans WHERE slug=? AND org_id=1 LIMIT 1').bind(`${serviceId}-${tierName}`).first();
+                if (!plan) {
+                  await db.prepare('INSERT INTO plans (org_id,name,slug,price,interval,is_public) VALUES (?,?,?,?,?,?)').bind(
+                    1, `${serviceId} ${tierName}`, `${serviceId}-${tierName}`, amountTotal, 'monthly', 1
+                  ).run();
+                  plan = await db.prepare('SELECT * FROM plans WHERE slug=? AND org_id=1 LIMIT 1').bind(`${serviceId}-${tierName}`).first();
+                }
+                if (plan) {
+                  const periodEnd = calcPeriodEnd(now(), 'monthly', 1);
+                  await db.prepare('INSERT INTO subscriptions (org_id,customer_id,plan_id,quantity,status,current_period_start,current_period_end) VALUES (?,?,?,?,?,?,?)').bind(
+                    1, customer.id, plan.id, 1, 'active', now(), periodEnd
+                  ).run();
+                  await db.prepare('UPDATE customers SET mrr=mrr+?,lifetime_value=lifetime_value+?,updated_at=? WHERE id=?').bind(amountTotal, amountTotal, now(), customer.id).run();
+                  await db.prepare('INSERT INTO activity_log (org_id,actor,action,target,details) VALUES (?,?,?,?,?)').bind(
+                    1, 'stripe', 'subscription.activated', `customer:${customer.id}`, `plan:${serviceId}-${tierName} amount:${amountTotal} stripe_session:${eventId}`
+                  ).run();
+                }
+              }
+            }
+          } else if (eventType === 'invoice.paid') {
+            const customerEmail = String(obj.customer_email || '');
+            const amountPaid = Number(obj.amount_paid || 0) / 100;
+            if (customerEmail && amountPaid > 0) {
+              await db.prepare('UPDATE customers SET lifetime_value=lifetime_value+?,updated_at=? WHERE email=?').bind(amountPaid, now(), customerEmail).run();
+              log('info', 'Invoice paid via Stripe', { email: customerEmail, amount: amountPaid });
+            }
+          } else if (eventType === 'customer.subscription.deleted') {
+            const stripeCustomerId = String(obj.customer || '');
+            if (stripeCustomerId) {
+              const customer = await db.prepare("SELECT * FROM customers WHERE payment_token=? AND payment_method='stripe' LIMIT 1").bind(stripeCustomerId).first();
+              if (customer) {
+                await db.prepare("UPDATE subscriptions SET status='canceled',canceled_at=?,cancel_reason=?,updated_at=? WHERE customer_id=? AND status='active'").bind(now(), 'stripe_webhook_cancellation', now(), customer.id).run();
+                log('info', 'Subscription canceled via Stripe webhook', { customer_id: customer.id, stripe_customer: stripeCustomerId });
+              }
+            }
+          }
+        } catch (processErr) {
+          log('error', 'Webhook event processing failed', { event_type: eventType, error: String(processErr) });
+        }
+      }
+
       return jsonOk({ ok: true, received: true, event_type: eventType });
     }
 
@@ -319,14 +494,19 @@ export default {
       const periodStart = trialEnd || n;
       const periodEnd = calcPeriodEnd(periodStart, plan.interval as string, Number(plan.interval_count) || 1);
       const status = trialDays > 0 ? 'trialing' : 'active';
-      // Apply coupon
+      // Apply coupon (atomic redemption to prevent over-redemption race)
       let discount = 0; let couponCode: string | null = null;
       if (body.coupon_code) {
         const coupon = await db.prepare('SELECT * FROM coupons WHERE code=? AND org_id=? AND status=?').bind(String(body.coupon_code).toUpperCase(), Number(org_id), 'active').first();
         if (coupon) {
-          couponCode = coupon.code as string;
-          if (coupon.discount_type === 'percent') discount = Number(coupon.discount_value);
-          await db.prepare('UPDATE coupons SET redemptions=redemptions+1 WHERE id=?').bind(coupon.id).run();
+          // Atomically increment redemptions only if under max_redemptions limit
+          const redeemResult = await db.prepare(
+            'UPDATE coupons SET redemptions=redemptions+1 WHERE id=? AND (max_redemptions IS NULL OR redemptions < max_redemptions)'
+          ).bind(coupon.id).run();
+          if (redeemResult.meta.changes) {
+            couponCode = coupon.code as string;
+            if (coupon.discount_type === 'percent') discount = Number(coupon.discount_value);
+          }
         }
       }
       const priceOverride = body.price_override !== undefined ? Number(body.price_override) : null;

@@ -1,6 +1,10 @@
 name = "echo-subscription"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+SITE_URL = "https://echo-ept.com"
 
 [observability]
 enabled = true
