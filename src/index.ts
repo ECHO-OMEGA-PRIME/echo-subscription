@@ -20,8 +20,16 @@ function sanitize(s: unknown, max = 500): string {
   return s.replace(/[\x00-\x1f]/g, '').slice(0, max);
 }
 
+const ALLOWED_ORIGINS = ['https://echo-ept.com','https://www.echo-ept.com','https://echo-op.com','https://www.echo-op.com','http://localhost:3000','http://localhost:3001'];
+
+let _corsOrigin = 'https://echo-ept.com';
+function setCorsOrigin(req: Request) {
+  const origin = req.headers.get('Origin') || '';
+  _corsOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+}
+
 function jsonOk(data: unknown, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': _corsOrigin } });
 }
 function jsonErr(msg: string, status = 400) {
   return jsonOk({ ok: false, error: msg }, status);
@@ -96,7 +104,8 @@ function today(): string { return new Date().toISOString().slice(0, 10); }
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
-    if (req.method === 'OPTIONS') return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,X-Echo-API-Key,Authorization' } });
+    setCorsOrigin(req);
+    if (req.method === 'OPTIONS') return new Response(null, { headers: { 'Access-Control-Allow-Origin': _corsOrigin, 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,X-Echo-API-Key,Authorization' } });
 
     const url = new URL(req.url);
     const p = url.pathname;
